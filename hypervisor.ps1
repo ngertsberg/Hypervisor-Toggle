@@ -8,18 +8,28 @@ $sgPath = "$scPath\SystemGuard"
 $lsaPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
 $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'
 
-# Disable values differ for some policies. Original values are saved before changes.
+# One symmetric source of truth for every registry setting managed by the app.
+# Policy values are changed only when already present, avoiding creation of
+# organization-managed policy keys on personal computers.
 $managed = @(
-    @{Id='VBS';Path=$dgPath;Name='EnableVirtualizationBasedSecurity';Off=0},
-    @{Id='PlatformSecurity';Path=$dgPath;Name='RequirePlatformSecurityFeatures';Off=0},
-    @{Id='Mandatory';Path=$dgPath;Name='Mandatory';Off=0},
-    @{Id='HVCI';Path=$hvciPath;Name='Enabled';Off=0},
-    @{Id='CG';Path=$lsaPath;Name='LsaCfgFlags';Off=0},
-    @{Id='CGPolicy';Path=$policyPath;Name='LsaCfgFlags';Off=0},
-    @{Id='VBSPolicy';Path=$policyPath;Name='EnableVirtualizationBasedSecurity';Off=0},
-    @{Id='HVCIPolicy';Path=$policyPath;Name='HypervisorEnforcedCodeIntegrity';Off=0},
-    @{Id='SGPolicy';Path=$policyPath;Name='ConfigureSystemGuardLaunch';Off=2},
-    @{Id='SystemGuard';Path=$sgPath;Name='Enabled';Off=0}
+    @{Id='VBS';Path=$dgPath;Name='EnableVirtualizationBasedSecurity';On=1;Off=0},
+    @{Id='PlatformSecurity';Path=$dgPath;Name='RequirePlatformSecurityFeatures';On=1;Off=0},
+    @{Id='VBSLock';Path=$dgPath;Name='Locked';On=0;Off=0},
+    @{Id='Mandatory';Path=$dgPath;Name='Mandatory';On=0;Off=0},
+    @{Id='HVCI';Path=$hvciPath;Name='Enabled';On=1;Off=0},
+    @{Id='HVCILock';Path=$hvciPath;Name='Locked';On=0;Off=0},
+    @{Id='HVCIUiOwner';Path=$hvciPath;Name='WasEnabledBy';On=2;Off=2},
+    @{Id='CredentialGuard';Path=$lsaPath;Name='LsaCfgFlags';On=2;Off=0},
+    @{Id='SystemGuard';Path=$sgPath;Name='Enabled';On=1;Off=0},
+    @{Id='CGPolicy';Path=$policyPath;Name='LsaCfgFlags';On=2;Off=0;OnlyIfPresent=$true},
+    @{Id='VBSPolicy';Path=$policyPath;Name='EnableVirtualizationBasedSecurity';On=1;Off=0;OnlyIfPresent=$true},
+    @{Id='HVCIPolicy';Path=$policyPath;Name='HypervisorEnforcedCodeIntegrity';On=2;Off=0;OnlyIfPresent=$true},
+    @{Id='SGPolicy';Path=$policyPath;Name='ConfigureSystemGuardLaunch';On=1;Off=2;OnlyIfPresent=$true}
+)
+$managedBoot = @(
+    @{Name='hypervisorlaunchtype';On='Auto';Off='Off'},
+    @{Name='vsmlaunchtype';On='Auto';Off='Off'},
+    @{Name='isolatedcontext';On='Yes';Off='No'}
 )
 
 function Get-RegValue([string]$Path,[string]$Name) {
@@ -37,6 +47,20 @@ function Set-Dword([string]$Path,[string]$Name,[int]$Value) {
         throw "Could not set registry value $Path\$Name to $Value. $($_.Exception.Message)"
     }
 }
+function Set-RegistryProtectionState([ValidateSet('On','Off')][string]$State) {
+    foreach ($setting in $managed) {
+        if ($setting.OnlyIfPresent -and $null -eq (Get-RegValue $setting.Path $setting.Name)) {
+            continue
+        }
+
+        $expected = [int]$setting[$State]
+        Set-Dword $setting.Path $setting.Name $expected
+        $actual = Get-RegValue $setting.Path $setting.Name
+        if ($null -eq $actual -or [int]$actual -ne $expected) {
+            throw "Registry verification failed for $($setting.Path)\$($setting.Name). Expected $expected but found $actual."
+        }
+    }
+}
 function Get-DeviceGuard {
     try { Get-CimInstance Win32_DeviceGuard -Namespace 'root\Microsoft\Windows\DeviceGuard' -ErrorAction Stop }
     catch { $null }
@@ -49,8 +73,25 @@ function Set-BcdSetting([string]$Name,[string]$Value) {
     $out = & "$env:SystemRoot\System32\bcdedit.exe" /set '{current}' $Name $Value 2>&1
     if ($LASTEXITCODE) { throw "BCDEdit could not set $Name to $Value. $(($out|Out-String).Trim())" }
 }
-function Set-HypervisorLaunch([ValidateSet('Auto','Off')][string]$Value) {
-    Set-BcdSetting 'hypervisorlaunchtype' $Value
+function Set-BootProtectionState([ValidateSet('On','Off')][string]$State) {
+    foreach ($setting in $managedBoot) {
+        Set-BcdSetting $setting.Name ([string]$setting[$State])
+    }
+}
+function Set-VanguardServiceMode([ValidateSet('Automatic','Demand')][string]$Mode,[switch]$Stop) {
+    $service = Get-Service -Name 'vgc' -ErrorAction SilentlyContinue
+    if ($null -eq $service) { return }
+
+    if ($Stop -and $service.Status -ne 'Stopped') {
+        try { Stop-Service -Name 'vgc' -Force -ErrorAction Stop }
+        catch { throw "Could not stop the Riot Vanguard vgc service. $($_.Exception.Message)" }
+    }
+
+    $startValue = if ($Mode -eq 'Automatic') { 'auto' } else { 'demand' }
+    $out = & "$env:SystemRoot\System32\sc.exe" config vgc start= $startValue 2>&1
+    if ($LASTEXITCODE) {
+        throw "Could not set the Riot Vanguard vgc service to $Mode. $(($out | Out-String).Trim())"
+    }
 }
 function Get-Locks {
     $r = [Collections.Generic.List[string]]::new()
@@ -59,46 +100,19 @@ function Get-Locks {
     if ((Get-RegValue $lsaPath 'LsaCfgFlags') -eq 1 -or (Get-RegValue $policyPath 'LsaCfgFlags') -eq 1) { $r.Add('Credential Guard UEFI lock') }
     $r
 }
-function Disable-ActiveProtections {
+function Disable-AllProtections {
     $locks = @(Get-Locks)
     if ($locks.Count) {
         throw "No changes were made. These settings need Microsoft's physical-presence UEFI opt-out process:`n`n- $($locks -join "`n- ")"
     }
-    $count = 0
-    foreach ($s in $managed) {
-        $v = Get-RegValue $s.Path $s.Name
-        if ($null -ne $v -and [int]$v -ne [int]$s.Off) {
-            Set-Dword $s.Path $s.Name ([int]$s.Off)
-            $count++
-        }
-    }
-    if (Get-HypervisorPresent) {
-        Set-HypervisorLaunch Off
-        $count++
-    }
-    $count
+    Set-VanguardServiceMode -Mode Demand -Stop
+    Set-RegistryProtectionState Off
+    Set-BootProtectionState Off
 }
 function Enable-AllProtections {
-    # Enable VBS and Memory Integrity without creating a UEFI lock.
-    Set-Dword $dgPath 'EnableVirtualizationBasedSecurity' 1
-    Set-Dword $dgPath 'RequirePlatformSecurityFeatures' 1
-    Set-Dword $dgPath 'Locked' 0
-    Set-Dword $hvciPath 'Enabled' 1
-    Set-Dword $hvciPath 'Locked' 0
-    Set-Dword $hvciPath 'WasEnabledBy' 2
-
-    # Value 2 enables Credential Guard without a UEFI lock.
-    Set-Dword $lsaPath 'LsaCfgFlags' 2
-    # If these policy values already exist, return them to enabled states without
-    # creating new policy keys that make Windows display "managed by your organization."
-    if ($null -ne (Get-RegValue $policyPath 'EnableVirtualizationBasedSecurity')) { Set-Dword $policyPath 'EnableVirtualizationBasedSecurity' 1 }
-    if ($null -ne (Get-RegValue $policyPath 'HypervisorEnforcedCodeIntegrity')) { Set-Dword $policyPath 'HypervisorEnforcedCodeIntegrity' 2 }
-    if ($null -ne (Get-RegValue $policyPath 'LsaCfgFlags')) { Set-Dword $policyPath 'LsaCfgFlags' 2 }
-    # Stage every boot-loader dependency now so supported hardware needs only
-    # the restart initiated by the Enable button.
-    Set-HypervisorLaunch Auto
-    Set-BcdSetting 'vsmlaunchtype' 'Auto'
-    Set-BcdSetting 'isolatedcontext' 'Yes'
+    Set-VanguardServiceMode -Mode Automatic
+    Set-RegistryProtectionState On
+    Set-BootProtectionState On
 }
 
 # Read the kernel's live Code Integrity flag so DSE status is not guessed from BCD.
@@ -201,7 +215,7 @@ function Refresh-Status {
 $refresh.Add_Click({Refresh-Status})
 $disable.Add_Click({
     try {
-        Disable-ActiveProtections | Out-Null
+        Disable-AllProtections
         Start-AdvancedRestart
     }
     catch{[Windows.Forms.MessageBox]::Show($_.Exception.Message,'Unable to disable all protections','OK','Error');Refresh-Status}
