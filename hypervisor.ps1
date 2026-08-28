@@ -1,3 +1,7 @@
+param(
+    [switch]$CompleteDisableDseStage
+)
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -7,6 +11,7 @@ $hvciPath = "$scPath\HypervisorEnforcedCodeIntegrity"
 $sgPath = "$scPath\SystemGuard"
 $lsaPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
 $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'
+$dseFollowUpTask = 'NickeysAwesome-HypervisorToggle-DSE'
 
 # One symmetric source of truth for every registry setting managed by the app.
 # Policy values are changed only when already present, avoiding creation of
@@ -133,13 +138,47 @@ function Get-DseStatus {
         if ($i.Options -band 1) { 'Enforced' } else { 'Disabled this boot' }
     } catch { 'Unknown' }
 }
-function Start-AdvancedRestart {
+function Start-AdvancedRestart([switch]$ClearFollowUpTask) {
     $bcdedit = "$env:SystemRoot\System32\bcdedit.exe"
     $out = & $bcdedit /set '{current}' onetimeadvancedoptions on 2>&1
     if ($LASTEXITCODE) {
         throw "Windows could not schedule the one-time Startup Settings menu. $(($out | Out-String).Trim())"
     }
-    Restart-Computer
+
+    if ($ClearFollowUpTask) {
+        try { Remove-DseFollowUpTask } catch { }
+    }
+
+    Restart-Computer -ErrorAction Stop
+}
+function Remove-DseFollowUpTask {
+    if (Get-ScheduledTask -TaskName $dseFollowUpTask -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $dseFollowUpTask -Confirm:$false -ErrorAction Stop
+    }
+}
+function Register-DseFollowUpTask {
+    if (-not $PSCommandPath) {
+        throw 'The DSE follow-up cannot be scheduled because the script path is unavailable.'
+    }
+
+    $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $scriptPath = [IO.Path]::GetFullPath($PSCommandPath)
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -CompleteDisableDseStage"
+    $action = New-ScheduledTaskAction -Execute $powerShell -Argument $arguments
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+    $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+
+    Register-ScheduledTask -TaskName $dseFollowUpTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+}
+
+# Startup Settings can retain the previous hypervisor/VBS launch state. The
+# disable flow therefore performs one normal boot first, then this one-time task
+# sends the already-disabled system to Startup Settings for the F7 DSE boot.
+if ($CompleteDisableDseStage) {
+    Start-AdvancedRestart -ClearFollowUpTask
+    exit
 }
 
 # ----- Styled GUI -----
@@ -175,7 +214,7 @@ function New-ActionButton($label,$x,$color) {
 $disable=New-ActionButton 'Disable all + restart' 30 $red
 $enable=New-ActionButton 'Enable all + restart' 340 $accent
 $dse=[Windows.Forms.Button]@{Text='Restart to disable DSE for one boot';ForeColor=$text;BackColor=$soft;Font=[Drawing.Font]::new('Segoe UI Semibold',9);FlatStyle='Flat';Cursor='Hand';Location=[Drawing.Point]::new(30,468);Size=[Drawing.Size]::new(590,40);UseVisualStyleBackColor=$false}; $dse.FlatAppearance.BorderSize=0; $form.Controls.Add($dse)
-$note=[Windows.Forms.Label]@{Text='Disable schedules the one-time boot options menu. On the next screen, press 7/F7 for DSE.';ForeColor=$muted;TextAlign='TopCenter';Location=[Drawing.Point]::new(31,525);Size=[Drawing.Size]::new(588,25)}; $form.Controls.Add($note)
+$note=[Windows.Forms.Label]@{Text='Disable uses a normal reboot, then automatically restarts to Startup Settings. Press 7/F7 for DSE.';ForeColor=$muted;TextAlign='TopCenter';Location=[Drawing.Point]::new(31,525);Size=[Drawing.Size]::new(588,30)}; $form.Controls.Add($note)
 
 function Set-Status($key,$label,$kind) {
     $values[$key].Text=$label.ToUpperInvariant()
@@ -216,14 +255,19 @@ $refresh.Add_Click({Refresh-Status})
 $disable.Add_Click({
     try {
         Disable-AllProtections
-        Start-AdvancedRestart
+        Register-DseFollowUpTask
+        Restart-Computer -ErrorAction Stop
     }
-    catch{[Windows.Forms.MessageBox]::Show($_.Exception.Message,'Unable to disable all protections','OK','Error');Refresh-Status}
+    catch{
+        try { Remove-DseFollowUpTask } catch { }
+        [Windows.Forms.MessageBox]::Show($_.Exception.Message,'Unable to complete the disable sequence','OK','Error');Refresh-Status
+    }
 })
 $enable.Add_Click({
     try {
+        Remove-DseFollowUpTask
         Enable-AllProtections
-        Restart-Computer
+        Restart-Computer -ErrorAction Stop
     }
     catch{[Windows.Forms.MessageBox]::Show($_.Exception.Message,'Enable failed','OK','Error');Refresh-Status}
 })

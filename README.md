@@ -25,13 +25,15 @@ Keep `Manager.bat` and `hypervisor.ps1` in the same folder, then double-click `M
 
 ### Disable all
 
-Click **Disable all + restart**. The manager explicitly writes the disabled value for every managed registry and boot setting, then schedules the one-time Windows advanced boot-options menu.
+Click **Disable all + restart**. The manager explicitly writes the disabled value for every managed registry and boot setting, then performs a normal restart so the hypervisor and VBS are actually stopped.
+
+After you sign in, a one-time elevated task automatically schedules a second restart into Windows Startup Settings. This two-stage sequence is intentional: on affected systems, going directly to the F7 Startup Settings boot can retain the previous hypervisor and VBS launch state.
 
 The disable action also turns off the hypervisor, Virtual Secure Mode, and isolated-context boot settings so the secure kernel does not remain active after restart.
 
 If Riot Vanguard is installed, the manager stops its `vgc` service and returns it to Demand Start for the disabled session.
 
-At the boot-options screen, press **7** or **F7** to select **Disable Driver Signature Enforcement**. DSE is disabled only for that Windows session and is automatically enforced again after a normal restart.
+At the boot-options screen following the automatic second restart, press **7** or **F7** to select **Disable Driver Signature Enforcement**. DSE is disabled only for that Windows session and is automatically enforced again after a normal restart.
 
 ### Enable all
 
@@ -50,6 +52,7 @@ The buttons are disabled visually and interactively when their operation is not 
 - The manager refuses the disable operation when it detects a UEFI-locked VBS feature. It does not modify BIOS or UEFI settings.
 - Some protections require compatible hardware and a supported Windows edition. A configured feature may not run when the platform does not support it.
 - Save open work before using either restart action.
+- **Disable all** performs two physical restarts: one normal restart to stop Hyper-V/VBS, followed by the one-time Startup Settings restart for DSE. Only the initial manager button and the required 7/F7 selection are manual.
 
 ## Files
 
