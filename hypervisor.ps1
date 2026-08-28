@@ -27,8 +27,15 @@ function Get-RegValue([string]$Path,[string]$Name) {
     catch { $null }
 }
 function Set-Dword([string]$Path,[string]$Name,[int]$Value) {
-    New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
-    New-ItemProperty -LiteralPath $Path -Name $Name -PropertyType DWord -Value $Value -Force -ErrorAction Stop | Out-Null
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            New-Item -Path $Path -ErrorAction Stop | Out-Null
+        }
+        New-ItemProperty -LiteralPath $Path -Name $Name -PropertyType DWord -Value $Value -Force -ErrorAction Stop | Out-Null
+    }
+    catch {
+        throw "Could not set registry value $Path\$Name to $Value. $($_.Exception.Message)"
+    }
 }
 function Get-DeviceGuard {
     try { Get-CimInstance Win32_DeviceGuard -Namespace 'root\Microsoft\Windows\DeviceGuard' -ErrorAction Stop }
@@ -38,9 +45,12 @@ function Get-HypervisorPresent {
     try { [bool](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).HypervisorPresent }
     catch { $false }
 }
+function Set-BcdSetting([string]$Name,[string]$Value) {
+    $out = & "$env:SystemRoot\System32\bcdedit.exe" /set '{current}' $Name $Value 2>&1
+    if ($LASTEXITCODE) { throw "BCDEdit could not set $Name to $Value. $(($out|Out-String).Trim())" }
+}
 function Set-HypervisorLaunch([ValidateSet('Auto','Off')][string]$Value) {
-    $out = & "$env:SystemRoot\System32\bcdedit.exe" /set hypervisorlaunchtype $Value 2>&1
-    if ($LASTEXITCODE) { throw "BCDEdit failed: $(($out|Out-String).Trim())" }
+    Set-BcdSetting 'hypervisorlaunchtype' $Value
 }
 function Get-Locks {
     $r = [Collections.Generic.List[string]]::new()
@@ -79,21 +89,16 @@ function Enable-AllProtections {
 
     # Value 2 enables Credential Guard without a UEFI lock.
     Set-Dword $lsaPath 'LsaCfgFlags' 2
-    Set-Dword $sgPath 'Enabled' 1
-
     # If these policy values already exist, return them to enabled states without
     # creating new policy keys that make Windows display "managed by your organization."
     if ($null -ne (Get-RegValue $policyPath 'EnableVirtualizationBasedSecurity')) { Set-Dword $policyPath 'EnableVirtualizationBasedSecurity' 1 }
     if ($null -ne (Get-RegValue $policyPath 'HypervisorEnforcedCodeIntegrity')) { Set-Dword $policyPath 'HypervisorEnforcedCodeIntegrity' 2 }
     if ($null -ne (Get-RegValue $policyPath 'LsaCfgFlags')) { Set-Dword $policyPath 'LsaCfgFlags' 2 }
-    if ($null -ne (Get-RegValue $policyPath 'ConfigureSystemGuardLaunch')) { Set-Dword $policyPath 'ConfigureSystemGuardLaunch' 1 }
-
+    # Stage every boot-loader dependency now so supported hardware needs only
+    # the restart initiated by the Enable button.
     Set-HypervisorLaunch Auto
-    foreach ($option in @(@('testsigning','off'),@('nointegritychecks','off'))) {
-        $out = & "$env:SystemRoot\System32\bcdedit.exe" /set $option[0] $option[1] 2>&1
-        if ($LASTEXITCODE) { throw "BCDEdit could not enforce DSE: $(($out | Out-String).Trim())" }
-    }
-
+    Set-BcdSetting 'vsmlaunchtype' 'Auto'
+    Set-BcdSetting 'isolatedcontext' 'Yes'
 }
 
 # Read the kernel's live Code Integrity flag so DSE status is not guessed from BCD.
@@ -129,19 +134,19 @@ $soft=[Drawing.Color]::FromArgb(34,40,55); $text=[Drawing.Color]::FromArgb(240,2
 $muted=[Drawing.Color]::FromArgb(151,160,181); $accent=[Drawing.Color]::FromArgb(94,114,228)
 $green=[Drawing.Color]::FromArgb(44,194,139); $red=[Drawing.Color]::FromArgb(239,91,112); $orange=[Drawing.Color]::FromArgb(244,169,66)
 
-$form=[Windows.Forms.Form]@{Text='Virtualization Security Manager';ClientSize=[Drawing.Size]::new(650,609);StartPosition='CenterScreen';FormBorderStyle='FixedSingle';MaximizeBox=$false;BackColor=$bg;ForeColor=$text;Font=[Drawing.Font]::new('Segoe UI',9)}
+$form=[Windows.Forms.Form]@{Text='Virtualization Security Manager';ClientSize=[Drawing.Size]::new(650,568);StartPosition='CenterScreen';FormBorderStyle='FixedSingle';MaximizeBox=$false;BackColor=$bg;ForeColor=$text;Font=[Drawing.Font]::new('Segoe UI',9)}
 $bar=[Windows.Forms.Panel]@{BackColor=$accent;Location=[Drawing.Point]::new(0,0);Size=[Drawing.Size]::new(6,104)}; $form.Controls.Add($bar)
 $eyebrow=[Windows.Forms.Label]@{Text='SYSTEM SECURITY';ForeColor=$accent;Font=[Drawing.Font]::new('Segoe UI Semibold',8);AutoSize=$true;Location=[Drawing.Point]::new(34,20)}; $form.Controls.Add($eyebrow)
 $title=[Windows.Forms.Label]@{Text='NICKEYS AWESOME Virtualization protection';ForeColor=$text;Font=[Drawing.Font]::new('Segoe UI Semibold',21);AutoSize=$true;Location=[Drawing.Point]::new(30,38)}; $form.Controls.Add($title)
 $sub=[Windows.Forms.Label]@{Text='Live status and reversible configuration for Windows security services.';ForeColor=$muted;AutoSize=$true;Location=[Drawing.Point]::new(34,80)}; $form.Controls.Add($sub)
-$panel=[Windows.Forms.Panel]@{BackColor=$card;Location=[Drawing.Point]::new(30,116);Size=[Drawing.Size]::new(590,309)}; $form.Controls.Add($panel)
+$panel=[Windows.Forms.Panel]@{BackColor=$card;Location=[Drawing.Point]::new(30,116);Size=[Drawing.Size]::new(590,268)}; $form.Controls.Add($panel)
 $caption=[Windows.Forms.Label]@{Text='CURRENT STATUS';ForeColor=$muted;Font=[Drawing.Font]::new('Segoe UI Semibold',8);AutoSize=$true;Location=[Drawing.Point]::new(22,16)}; $panel.Controls.Add($caption)
 $refresh=[Windows.Forms.Button]@{Text='Refresh';ForeColor=$text;BackColor=$soft;FlatStyle='Flat';Location=[Drawing.Point]::new(482,10);Size=[Drawing.Size]::new(84,30);Cursor='Hand';UseVisualStyleBackColor=$false}; $refresh.FlatAppearance.BorderSize=0; $panel.Controls.Add($refresh)
 
 $features=@(
  @{K='Hypervisor';N='Windows hypervisor';D='Hyper-V launch state'},@{K='VBS';N='Virtualization-based Security';D='Secure kernel isolation'},
  @{K='Memory';N='Memory Integrity';D='Hypervisor-protected code integrity'},@{K='Credential';N='Credential Guard';D='Credential isolation'},
- @{K='SystemGuard';N='System Guard Secure Launch';D='Firmware and boot protection'},@{K='DSE';N='Driver Signature Enforcement';D='Kernel driver signature checks'}
+ @{K='DSE';N='Driver Signature Enforcement';D='Kernel driver signature checks'}
 )
 $values=@{}; $y=56
 foreach($f in $features) {
@@ -151,12 +156,12 @@ foreach($f in $features) {
     $y+=41
 }
 function New-ActionButton($label,$x,$color) {
-    $b=[Windows.Forms.Button]@{Text=$label;ForeColor=[Drawing.Color]::White;BackColor=$color;Font=[Drawing.Font]::new('Segoe UI Semibold',10);FlatStyle='Flat';Cursor='Hand';Location=[Drawing.Point]::new($x,447);Size=[Drawing.Size]::new(280,48);UseVisualStyleBackColor=$false}; $b.FlatAppearance.BorderSize=0; $form.Controls.Add($b); $b
+    $b=[Windows.Forms.Button]@{Text=$label;ForeColor=[Drawing.Color]::White;BackColor=$color;Font=[Drawing.Font]::new('Segoe UI Semibold',10);FlatStyle='Flat';Cursor='Hand';Location=[Drawing.Point]::new($x,406);Size=[Drawing.Size]::new(280,48);UseVisualStyleBackColor=$false}; $b.FlatAppearance.BorderSize=0; $form.Controls.Add($b); $b
 }
 $disable=New-ActionButton 'Disable all + restart' 30 $red
 $enable=New-ActionButton 'Enable all + restart' 340 $accent
-$dse=[Windows.Forms.Button]@{Text='Restart to disable DSE for one boot';ForeColor=$text;BackColor=$soft;Font=[Drawing.Font]::new('Segoe UI Semibold',9);FlatStyle='Flat';Cursor='Hand';Location=[Drawing.Point]::new(30,509);Size=[Drawing.Size]::new(590,40);UseVisualStyleBackColor=$false}; $dse.FlatAppearance.BorderSize=0; $form.Controls.Add($dse)
-$note=[Windows.Forms.Label]@{Text='Disable schedules the one-time boot options menu. On the next screen, press 7/F7 for DSE.';ForeColor=$muted;TextAlign='TopCenter';Location=[Drawing.Point]::new(31,566);Size=[Drawing.Size]::new(588,25)}; $form.Controls.Add($note)
+$dse=[Windows.Forms.Button]@{Text='Restart to disable DSE for one boot';ForeColor=$text;BackColor=$soft;Font=[Drawing.Font]::new('Segoe UI Semibold',9);FlatStyle='Flat';Cursor='Hand';Location=[Drawing.Point]::new(30,468);Size=[Drawing.Size]::new(590,40);UseVisualStyleBackColor=$false}; $dse.FlatAppearance.BorderSize=0; $form.Controls.Add($dse)
+$note=[Windows.Forms.Label]@{Text='Disable schedules the one-time boot options menu. On the next screen, press 7/F7 for DSE.';ForeColor=$muted;TextAlign='TopCenter';Location=[Drawing.Point]::new(31,525);Size=[Drawing.Size]::new(588,25)}; $form.Controls.Add($note)
 
 function Set-Status($key,$label,$kind) {
     $values[$key].Text=$label.ToUpperInvariant()
@@ -180,17 +185,15 @@ function Refresh-Status {
     $vbsOn=($dg -and $dg.VirtualizationBasedSecurityStatus -gt 0) -or (Get-RegValue $dgPath 'EnableVirtualizationBasedSecurity') -eq 1
     $memoryOn=($running -contains 2) -or ($configured -contains 2) -or (Get-RegValue $hvciPath Enabled) -eq 1
     $credentialOn=($running -contains 1) -or ($configured -contains 1) -or (Get-RegValue $lsaPath LsaCfgFlags) -gt 0 -or (Get-RegValue $policyPath LsaCfgFlags) -gt 0
-    $systemGuardOn=($running -contains 3) -or ($configured -contains 3) -or (Get-RegValue $sgPath Enabled) -eq 1
 
     if($hypervisorOn){Set-Status Hypervisor Running Good}else{Set-Status Hypervisor 'Not running' Bad}
     if($dg -and $dg.VirtualizationBasedSecurityStatus -eq 2){Set-Status VBS Running Good}elseif($vbsOn){Set-Status VBS 'Configured / restart' Warn}else{Set-Status VBS Disabled Bad}
     if($running -contains 2){Set-Status Memory Running Good}elseif($memoryOn){Set-Status Memory 'Configured / restart' Warn}else{Set-Status Memory Disabled Bad}
     if($running -contains 1){Set-Status Credential Running Good}elseif($credentialOn){Set-Status Credential 'Configured / restart' Warn}else{Set-Status Credential Disabled Bad}
-    if($running -contains 3){Set-Status SystemGuard Running Good}elseif($systemGuardOn){Set-Status SystemGuard 'Configured / restart' Warn}else{Set-Status SystemGuard Disabled Bad}
     $ds=Get-DseStatus; if($ds -eq 'Enforced'){Set-Status DSE $ds Good}elseif($ds -eq 'Unknown'){Set-Status DSE $ds Neutral}else{Set-Status DSE $ds Bad}
 
-    $anythingOn=$hypervisorOn -or $vbsOn -or $memoryOn -or $credentialOn -or $systemGuardOn -or $ds -eq 'Enforced'
-    $everythingOn=$hypervisorOn -and $vbsOn -and $memoryOn -and $credentialOn -and $systemGuardOn -and $ds -eq 'Enforced'
+    $anythingOn=$hypervisorOn -or $vbsOn -or $memoryOn -or $credentialOn -or $ds -eq 'Enforced'
+    $everythingOn=$hypervisorOn -and $vbsOn -and $memoryOn -and $credentialOn -and $ds -eq 'Enforced'
     Set-ActionState $disable $anythingOn $red
     Set-ActionState $enable (-not $everythingOn) $accent
     Set-ActionState $dse ($ds -ne 'Disabled this boot') $soft

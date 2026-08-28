@@ -8,7 +8,6 @@ A Windows PowerShell GUI for viewing and toggling virtualization-based security 
 - Virtualization-based Security (VBS)
 - Memory Integrity / Hypervisor-protected Code Integrity (HVCI)
 - Credential Guard
-- System Guard Secure Launch
 - Driver Signature Enforcement (DSE)
 
 Windows Hello and biometric settings are intentionally not modified.
@@ -31,7 +30,9 @@ At the boot-options screen, press **7** or **F7** to select **Disable Driver Sig
 
 ### Enable all
 
-Click **Enable all + restart**. The manager explicitly enables the hypervisor, VBS, Memory Integrity, Credential Guard, System Guard, and DSE, then performs a normal restart.
+Click **Enable all + restart**. The manager explicitly enables the hypervisor, VBS, Memory Integrity, Credential Guard, and DSE, then performs a normal restart.
+
+The manager stages the hypervisor, Virtual Secure Mode, and isolated-context boot settings before restarting so supported systems do not need a second configuration restart.
 
 The buttons are disabled visually and interactively when their operation is not applicable to the current system state.
 
